@@ -1,95 +1,84 @@
-import os
-from dotenv import load_dotenv
-import yaml
-
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
+from fastapi import FastAPI, Request
+from fastapi.responses import PlainTextResponse, JSONResponse
+from prometheus_client import Counter, generate_latest, CONTENT_TYPE_LATEST
+import time
+import uuid
+import logging
+import json
+from collections import deque
 
 app = FastAPI()
 
-# Allow browser access
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+# Startup time
+START_TIME = time.time()
+
+# Keep last 1000 logs
+LOG_BUFFER = deque(maxlen=1000)
+
+# Prometheus counter
+http_requests_total = Counter(
+    "http_requests_total",
+    "Total HTTP requests"
 )
 
-load_dotenv()
-
-# -----------------------
-# Defaults
-# -----------------------
-
-config = {
-    "port": 8000,
-    "workers": 1,
-    "debug": False,
-    "log_level": "info",
-    "api_key": "default-secret-000",
-}
-
-# -----------------------
-# YAML
-# -----------------------
-
-with open("config.development.yaml") as f:
-    yaml_cfg = yaml.safe_load(f) or {}
-
-config.update(yaml_cfg)
-
-# -----------------------
-# .env
-# -----------------------
-
-env_mapping = {
-    "APP_PORT": "port",
-    "APP_DEBUG": "debug",
-    "APP_LOG_LEVEL": "log_level",
-    "APP_API_KEY": "api_key",
-    "NUM_WORKERS": "workers",
-}
-
-for env_key, cfg_key in env_mapping.items():
-    value = os.getenv(env_key)
-    if value is not None:
-        config[cfg_key] = value
-
-# -----------------------
-# OS ENV (higher priority)
-# -----------------------
-
-# (Render environment variables automatically override .env)
-
-for env_key, cfg_key in env_mapping.items():
-    if env_key in os.environ:
-        config[cfg_key] = os.environ[env_key]
+# JSON logger
+logger = logging.getLogger("app")
+logger.setLevel(logging.INFO)
 
 
-def convert_bool(v):
-    return str(v).lower() in ("true", "1", "yes", "on")
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    request_id = str(uuid.uuid4())
+
+    # Count every request
+    http_requests_total.inc()
+
+    response = await call_next(request)
+
+    entry = {
+        "level": "INFO",
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "path": request.url.path,
+        "request_id": request_id,
+    }
+
+    LOG_BUFFER.append(entry)
+    logger.info(json.dumps(entry))
+
+    response.headers["X-Request-ID"] = request_id
+    return response
 
 
-@app.get("/effective-config")
-def effective_config(set: list[str] = Query(default=[])):
+@app.get("/work")
+def work(n: int = 1):
+    # Simulate work
+    total = 0
+    for i in range(n):
+        total += i
 
-    final = dict(config)
+    return {
+        "email": "YOUR_EMAIL@example.com",
+        "done": n
+    }
 
-    # CLI overrides
-    for item in set:
-        if "=" not in item:
-            continue
 
-        k, v = item.split("=", 1)
-        final[k] = v
+@app.get("/healthz")
+def health():
+    return {
+        "status": "ok",
+        "uptime_s": time.time() - START_TIME
+    }
 
-    # Type coercion
-    final["port"] = int(final["port"])
-    final["workers"] = int(final["workers"])
-    final["debug"] = convert_bool(final["debug"])
-    final["log_level"] = str(final["log_level"])
 
-    # Mask secret
-    final["api_key"] = "****"
+@app.get("/metrics")
+def metrics():
+    return PlainTextResponse(
+        generate_latest().decode(),
+        media_type=CONTENT_TYPE_LATEST,
+    )
 
-    return final
+
+@app.get("/logs/tail")
+def tail(limit: int = 10):
+    limit = max(1, min(limit, len(LOG_BUFFER)))
+    return JSONResponse(list(LOG_BUFFER)[-limit:])
